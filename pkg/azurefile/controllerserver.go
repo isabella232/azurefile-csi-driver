@@ -72,7 +72,8 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		return nil, err
 	}
 
-	if len(req.GetName()) == 0 {
+	volName := req.GetName()
+	if len(volName) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "CreateVolume Name must be provided")
 	}
 	volumeCapabilities := req.GetVolumeCapabilities()
@@ -86,6 +87,11 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		requestGiB = defaultAzureFileQuota
 		klog.Warningf("no quota specified, set as default value(%d GiB)", defaultAzureFileQuota)
 	}
+
+	if acquired := d.volumeLocks.TryAcquire(volName); !acquired {
+		return nil, status.Errorf(codes.Aborted, volumeOperationAlreadyExistsFmt, volName)
+	}
+	defer d.volumeLocks.Release(volName)
 
 	parameters := req.GetParameters()
 	if parameters == nil {
@@ -177,7 +183,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 
 	validFileShareName := fileShareName
 	if validFileShareName == "" {
-		name := req.GetName()
+		name := volName
 		if protocol == nfs {
 			// use "pvcn" prefix for nfs protocol file share
 			name = strings.Replace(name, "pvc", "pvcn", 1)
@@ -314,7 +320,8 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 
 // DeleteVolume delete an azure file
 func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
-	if len(req.GetVolumeId()) == 0 {
+	volumeID := req.GetVolumeId()
+	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
 	}
 
@@ -322,7 +329,11 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 		return nil, status.Errorf(codes.InvalidArgument, "invalid delete volume request: %v", req)
 	}
 
-	volumeID := req.VolumeId
+	if acquired := d.volumeLocks.TryAcquire(volumeID); !acquired {
+		return nil, status.Errorf(codes.Aborted, volumeOperationAlreadyExistsFmt, volumeID)
+	}
+	defer d.volumeLocks.Release(volumeID)
+
 	resourceGroupName, accountName, fileShareName, _, err := GetFileShareInfo(volumeID)
 	if err != nil {
 		// According to CSI Driver Sanity Tester, should succeed when an invalid volume id is used
@@ -425,6 +436,11 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 		return nil, status.Error(codes.InvalidArgument, "Node ID not provided")
 	}
 
+	if acquired := d.volumeLocks.TryAcquire(volumeID); !acquired {
+		return nil, status.Errorf(codes.Aborted, volumeOperationAlreadyExistsFmt, volumeID)
+	}
+	defer d.volumeLocks.Release(volumeID)
+
 	_, accountName, accountKey, fileShareName, diskName, err := d.GetAccountInfo(volumeID, req.GetSecrets(), req.GetVolumeContext())
 	// always check diskName first since if it's not vhd disk attach, ControllerPublishVolume is not necessary
 	if diskName == "" {
@@ -458,8 +474,6 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 		return nil, status.Error(codes.Internal, fmt.Sprintf("getFileURL(%s,%s,%s,%s) returned empty fileURL", accountName, storageEndpointSuffix, fileShareName, diskName))
 	}
 
-	d.volLockMap.LockEntry(volumeID)
-	defer d.volLockMap.UnlockEntry(volumeID)
 	properties, err := fileURL.GetProperties(ctx)
 	if err != nil {
 		return nil, status.Error(codes.Internal, fmt.Sprintf("GetProperties for volume(%s) on node(%s) returned with error: %v", volumeID, nodeID, err))
@@ -485,7 +499,6 @@ func (d *Driver) ControllerUnpublishVolume(ctx context.Context, req *csi.Control
 		mc.ObserveOperationWithResult(isOperationSucceeded)
 	}()
 
-	klog.V(2).Infof("ControllerUnpublishVolume: called with args %+v", *req)
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
@@ -495,6 +508,11 @@ func (d *Driver) ControllerUnpublishVolume(ctx context.Context, req *csi.Control
 	if len(nodeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Node ID not provided")
 	}
+
+	if acquired := d.volumeLocks.TryAcquire(volumeID); !acquired {
+		return nil, status.Errorf(codes.Aborted, volumeOperationAlreadyExistsFmt, volumeID)
+	}
+	defer d.volumeLocks.Release(volumeID)
 
 	_, accountName, accountKey, fileShareName, diskName, err := d.GetAccountInfo(volumeID, req.GetSecrets(), map[string]string{})
 	// always check diskName first since if it's not vhd disk detach, ControllerUnpublishVolume is not necessary
@@ -516,9 +534,6 @@ func (d *Driver) ControllerUnpublishVolume(ctx context.Context, req *csi.Control
 		return nil, status.Error(codes.Internal, fmt.Sprintf("getFileURL(%s,%s,%s,%s) returned empty fileURL", accountName, storageEndpointSuffix, fileShareName, diskName))
 	}
 
-	d.volLockMap.LockEntry(volumeID)
-	defer d.volLockMap.UnlockEntry(volumeID)
-
 	if _, err = fileURL.SetMetadata(ctx, azfile.Metadata{metaDataNode: ""}); err != nil {
 		return nil, status.Error(codes.Internal, fmt.Sprintf("SetMetadata for volume(%s) on node(%s) returned with error: %v", volumeID, nodeID, err))
 	}
@@ -537,6 +552,11 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 	if len(sourceVolumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "CreateSnapshot Source Volume ID must be provided")
 	}
+
+	if acquired := d.volumeLocks.TryAcquire(sourceVolumeID); !acquired {
+		return nil, status.Errorf(codes.Aborted, volumeOperationAlreadyExistsFmt, sourceVolumeID)
+	}
+	defer d.volumeLocks.Release(sourceVolumeID)
 
 	exists, item, err := d.snapshotExists(ctx, sourceVolumeID, snapshotName, req.GetSecrets())
 	if err != nil {
